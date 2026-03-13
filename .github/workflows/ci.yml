@@ -1,0 +1,210 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: api/package-lock.json
+
+      - name: Install API dependencies
+        run: cd api && npm ci
+
+      - name: Lint
+        run: cd api && npm run lint
+
+      - name: Unit tests
+        run: cd api && npm run test -- --watchman=false
+
+      - name: E2E tests
+        run: cd api && npm run test:e2e -- --watchman=false
+
+  terraform-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+      - name: Validate Terraform (dev + prod)
+        run: ./scripts/terraform-validate.sh
+
+  deploy-dev:
+    needs: test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+
+      - name: Configure Terraform backend (dev)
+        working-directory: infra/terraform/environments/dev
+        run: |
+          if [ -n "${{ vars.TF_STATE_BUCKET }}" ]; then
+            cp backend.tf.s3.example backend.tf
+            echo 'bucket  = "${{ vars.TF_STATE_BUCKET }}"' > backend.hcl
+            echo 'key     = "${{ vars.TF_STATE_KEY }}"' >> backend.hcl
+            echo 'region  = "${{ vars.TF_STATE_REGION }}"' >> backend.hcl
+            echo 'encrypt = true' >> backend.hcl
+          fi
+
+      - name: Terraform Init (dev)
+        working-directory: infra/terraform/environments/dev
+        run: |
+          if [ -f backend.hcl ]; then
+            terraform init -backend-config=backend.hcl -input=false
+          else
+            terraform init -input=false
+          fi
+
+      - name: Terraform Apply (dev)
+        working-directory: infra/terraform/environments/dev
+        run: terraform apply -auto-approve -var-file=terraform.tfvars
+        env:
+          TF_VAR_image_tag: latest
+
+      - name: Get ECR repository URL
+        id: ecr
+        working-directory: infra/terraform/environments/dev
+        run: echo "url=$(terraform output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin ${{ steps.ecr.outputs.url }}
+
+      - name: Build and push Docker image
+        run: |
+          docker build --platform linux/amd64 -t ${{ steps.ecr.outputs.url }}:latest ./api
+          docker push ${{ steps.ecr.outputs.url }}:latest
+
+      - name: Trigger App Runner deployment (dev)
+        working-directory: infra/terraform/environments/dev
+        run: |
+          SERVICE_ID=$(terraform output -raw app_runner_service_id)
+          aws apprunner start-deployment --service-identifier "$SERVICE_ID" --region ${{ env.AWS_REGION }}
+
+      - name: Get App Runner service URL
+        id: apprunner
+        working-directory: infra/terraform/environments/dev
+        run: |
+          RAW=$(terraform output -raw app_runner_service_url)
+          echo "url=https://${RAW#https://}" >> $GITHUB_OUTPUT
+
+      - name: Wait for App Runner to be ready
+        run: |
+          echo "Waiting 90s for App Runner to deploy the new image..."
+          sleep 90
+
+      - name: Run deployment tests
+        run: ./scripts/deploy-tests.sh "${{ steps.apprunner.outputs.url }}"
+
+  deploy-prod:
+    needs: test
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod'
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+
+      - name: Configure Terraform backend (prod)
+        working-directory: infra/terraform/environments/prod
+        run: |
+          if [ -n "${{ vars.TF_STATE_BUCKET }}" ]; then
+            cp backend.tf.s3.example backend.tf
+            echo 'bucket  = "${{ vars.TF_STATE_BUCKET }}"' > backend.hcl
+            echo 'key     = "${{ vars.TF_STATE_KEY }}"' >> backend.hcl
+            echo 'region  = "${{ vars.TF_STATE_REGION }}"' >> backend.hcl
+            echo 'encrypt = true' >> backend.hcl
+          fi
+
+      - name: Terraform Init (prod)
+        working-directory: infra/terraform/environments/prod
+        run: |
+          if [ -f backend.hcl ]; then
+            terraform init -backend-config=backend.hcl -input=false
+          else
+            terraform init -input=false
+          fi
+
+      - name: Terraform Apply (prod)
+        working-directory: infra/terraform/environments/prod
+        run: terraform apply -auto-approve -var-file=terraform.tfvars -var="image_tag=latest"
+
+      - name: Get ECR repository URL
+        id: ecr
+        working-directory: infra/terraform/environments/prod
+        run: echo "url=$(terraform output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin ${{ steps.ecr.outputs.url }}
+
+      - name: Build and push Docker image
+        run: |
+          docker build --platform linux/amd64 -t ${{ steps.ecr.outputs.url }}:latest ./api
+          docker push ${{ steps.ecr.outputs.url }}:latest
+
+      - name: Trigger App Runner deployment (prod)
+        run: |
+          SERVICE_ID=$(cd infra/terraform/environments/prod && terraform output -raw app_runner_service_id)
+          aws apprunner start-deployment --service-identifier "$SERVICE_ID" --region ${{ env.AWS_REGION }}
+          echo "Deployment started. Run deploy tests manually against the service URL after it is ready."

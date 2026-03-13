@@ -1,0 +1,4 @@
+bucket  = "TU-BUCKET-payments-api-terraform-state"
+key     = "payments-api/prod/terraform.tfstate"
+region  = "us-east-1"
+encrypt = true

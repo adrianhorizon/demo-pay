@@ -1,0 +1,6 @@
+aws_region        = "us-east-1"
+state_bucket_name = "TU-CUENTA-payments-api-terraform-state"
+
+tags = {
+  Project = "payments-api"
+}
